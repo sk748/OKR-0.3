@@ -82,6 +82,25 @@ We are executing this in four phases. Do not skip ahead.
 - **Phase 3.** Import the existing React/Vite frontend into `frontend/`, strip out hardcoded mock arrays from `ObjectiveList.tsx`, `Analytics.tsx`, `StatsCards.tsx`, `History.tsx`, `Settings.tsx`, and wire them to the Phase 2 API endpoints using React Query.
 - **Phase 4.** Flask-SocketIO chat with regex DLP scrubber, plus the Celery outbox worker and HMAC signer for the dual-portal sync.
 
+- ## Skills available in this repo
+
+Claude Code should use the skills stored under `.claude/skills/` when their trigger conditions match.
+
+### frontend-design (`.claude/skills/frontend-design/SKILL.md`)
+
+**When to use:** Any time Phase 3 or later work touches React components, Tailwind styling, page layouts, dashboards, forms, or any visual/UI element. This includes rewriting the existing components (`ObjectiveList.tsx`, `Analytics.tsx`, `StatsCards.tsx`, `History.tsx`, `Settings.tsx`) and building any new UI.
+
+**Why:** The existing frontend shell is generic. When wiring it to real data, we want the rebuild to produce a distinctive, production-grade interface rather than default AI-slop aesthetics. The skill enforces intentional typography, color, and layout choices.
+
+**Important context for this project specifically:**
+- This is an **investment bank** enterprise portal, not a consumer app. The aesthetic direction should lean toward refined, serious, data-dense, and trustworthy — not playful or maximalist.
+- Think "Bloomberg terminal meets editorial magazine" rather than "startup landing page."
+- Avoid: purple gradients, Inter, generic SaaS dashboard patterns, emoji icons, pastel color schemes.
+- Favor: restrained color palette with one strong accent, characterful but legible typography, generous use of monospace for numeric data, dark-mode-first (the existing shell is already dark).
+- Accessibility is non-negotiable. This will be used by regulated-industry staff; WCAG AA minimum.
+
+**Do NOT use this skill during Phase 2** (backend services). It is only relevant once we start wiring the frontend in Phase 3.
+
 ## Working style for Claude Code
 
 - **Always use Plan Mode on the first pass of a new file** so I can review the approach before code is written.
