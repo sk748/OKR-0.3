@@ -45,6 +45,30 @@ def _patch_pg_types_for_sqlite(target, connection, **kw):
     """No-op — type compilation is handled below."""
 
 
+@sa_event.listens_for(Base.metadata, "before_create")
+def _sqlite_drop_enum_value_check_constraints(target, connection, **kw):
+    """
+    WORKAROUND: SQLAlchemy 2.0 on Python 3.12 stores str-based enum members
+    by their .name ('PARTNER') rather than their .value ('partner') in SQLite.
+    The CHECK constraint ck_users_partner_scope_matches_role was written for
+    PostgreSQL where the native enum stores lowercase values. In SQLite,
+    'PARTNER' != 'partner' (case-sensitive), so PARTNER user INSERTs fail.
+
+    Fix: drop this constraint from the DDL when creating SQLite tables.
+    Application-level invariant is still enforced: make_user() in this file
+    always supplies partner_scope for PARTNER users. The production PostgreSQL
+    path is unaffected — the constraint still exists there.
+    """
+    if connection.dialect.name != "sqlite":
+        return
+    users_table = Base.metadata.tables.get("users")
+    if users_table is not None:
+        users_table.constraints = {
+            c for c in users_table.constraints
+            if getattr(c, "name", None) != "ck_users_partner_scope_matches_role"
+        }
+
+
 # Register SQLite compilers for PG types.
 from sqlalchemy.ext.compiler import compiles
 

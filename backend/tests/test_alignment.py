@@ -133,6 +133,12 @@ class TestCreateCascadeLink:
         with pytest.raises(PermissionError):
             create_cascade_link(parent_kr, child_obj, other_employee, db_session)
 
+    def test_cascade_denies_partner(self, db_session):
+        _, _, _, parent_kr, child_obj = self._setup(db_session)
+        partner = make_user(db_session, role=UserRole.PARTNER)
+        with pytest.raises(PermissionError):
+            create_cascade_link(parent_kr, child_obj, partner, db_session)
+
     def test_cascade_fails_if_already_aligned(self, db_session):
         owner, _, parent_obj, parent_kr, child_obj = self._setup(db_session)
         # Pre-align child_obj to some other KR
