@@ -353,6 +353,7 @@ class Objective(Base):
     cycle: Mapped[Cycle] = relationship(back_populates="objectives")
     key_results: Mapped[list["KeyResult"]] = relationship(
         back_populates="objective",
+        foreign_keys="[KeyResult.objective_id]",
         cascade="all, delete-orphan",
         order_by="KeyResult.display_order",
     )
@@ -440,7 +441,10 @@ class KeyResult(Base):
     )
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    objective: Mapped[Objective] = relationship(back_populates="key_results")
+    objective: Mapped[Objective] = relationship(
+        back_populates="key_results",
+        foreign_keys=[objective_id],
+    )
     owner: Mapped[User] = relationship()
     tasks: Mapped[list["Task"]] = relationship(
         back_populates="key_result", cascade="all, delete-orphan"
