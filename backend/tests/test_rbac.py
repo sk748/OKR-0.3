@@ -5,12 +5,12 @@ All tests use real model instances against an in-memory SQLite session.
 No mocks. Fixtures from conftest.py.
 
 Structure:
-  TestScopedObjectivesQuery   — 8 tests
+  TestScopedObjectivesQuery   — 14 tests
   TestScopedKeyResultsQuery   — 6 tests
   TestScopedTasksQuery        — 9 tests
   TestScopedChatQuery         — 9 tests (includes TIGHTENING 2 partner tests)
-  TestCanViewPredicates       — 10 tests
-  TestCanModifyPredicates     — 13 tests (includes TIGHTENING 1 KR tests)
+  TestCanViewPredicates       — 14 tests
+  TestCanModifyPredicates     — 16 tests (includes TIGHTENING 1 KR tests)
   TestRequireRole             — 5 tests
 """
 
@@ -26,6 +26,7 @@ from backend.app.models import (
     AuditLog,
     ChatMessage,
     OKRLevel,
+    RoleOnTeam,
     Task,
     TaskStatus,
     UserRole,
@@ -44,10 +45,13 @@ from backend.app.services.rbac import (
     scoped_tasks_query,
 )
 from backend.tests.conftest import (
+    make_c_suite_user,
     make_cycle,
     make_department,
     make_key_result,
     make_objective,
+    make_project_member,
+    make_project_team,
     make_task,
     make_user,
 )
@@ -114,10 +118,19 @@ class TestScopedObjectivesQuery:
         results = list(db_session.execute(q).scalars())
         assert obj in results
 
-    def test_executive_sees_all_objectives(self, db_session):
+    def test_c_suite_executive_sees_all_objectives(self, db_session):
+        """is_c_suite executive sees all objectives regardless of dept."""
         owner, _, _, obj = self._setup(db_session)
-        exec_user = make_user(db_session, role=UserRole.EXECUTIVE)
+        exec_user = make_c_suite_user(db_session, role=UserRole.EXECUTIVE)
         q = scoped_objectives_query(exec_user, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj in results
+
+    def test_c_suite_compliance_sees_all(self, db_session):
+        """is_c_suite=True with EMPLOYEE role still sees everything."""
+        owner, _, _, obj = self._setup(db_session)
+        compliance = make_c_suite_user(db_session, role=UserRole.EMPLOYEE)
+        q = scoped_objectives_query(compliance, db_session)
         results = list(db_session.execute(q).scalars())
         assert obj in results
 
@@ -127,14 +140,8 @@ class TestScopedObjectivesQuery:
         results = list(db_session.execute(q).scalars())
         assert obj in results
 
-    def test_employee_sees_dept_objectives(self, db_session):
-        owner, _, dept, obj = self._setup(db_session)
-        colleague = make_user(db_session, department=dept)
-        q = scoped_objectives_query(colleague, db_session)
-        results = list(db_session.execute(q).scalars())
-        assert obj in results
-
     def test_employee_excludes_other_dept_objectives(self, db_session):
+        """Employee in dept B cannot see objective in dept A (no project link)."""
         owner, _, dept, obj = self._setup(db_session)
         other_dept = make_department(db_session, name="Other Dept", slug="other-dept")
         outsider = make_user(db_session, department=other_dept)
@@ -163,6 +170,103 @@ class TestScopedObjectivesQuery:
         assert logs[0].action == "rbac.denied.objectives_query"
         assert logs[0].actor_id == partner.id
 
+    # --- Phase 2.4 new tests ---
+
+    def test_department_head_sees_dept_objectives(self, db_session):
+        """Non-c_suite EXECUTIVE with dept_id sees objectives in their dept."""
+        owner, cycle, dept, obj = self._setup(db_session)
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=dept)
+        q = scoped_objectives_query(exec_user, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj in results
+
+    def test_department_head_cannot_see_other_dept_objectives(self, db_session):
+        """Non-c_suite EXECUTIVE cannot see objectives from a different dept."""
+        owner, cycle, dept, obj = self._setup(db_session)
+        other_dept = make_department(db_session, name="Other", slug="exec-other")
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=other_dept)
+        q = scoped_objectives_query(exec_user, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj not in results
+
+    def test_department_head_sees_participating_project_objectives(self, db_session):
+        """EXECUTIVE sees objective on project where their dept is a participant."""
+        exec_dept = make_department(db_session, name="Exec Dept", slug="exec-pt")
+        other_dept = make_department(db_session, name="Other Dept", slug="other-pt")
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=exec_dept)
+        owner = make_user(db_session, department=other_dept)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(
+            db_session,
+            primary_department=other_dept,
+            participating_departments=[exec_dept],
+        )
+        obj = make_objective(
+            db_session, owner=owner, cycle=cycle, project_team_id=pt.id
+        )
+        q = scoped_objectives_query(exec_user, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj in results
+
+    def test_department_head_sees_report_objectives(self, db_session):
+        """EXECUTIVE sees objective owned by their direct report."""
+        exec_dept = make_department(db_session, name="Exec Dept", slug="exec-rpt")
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=exec_dept)
+        report = make_user(db_session, department=exec_dept, manager=exec_user)
+        cycle = make_cycle(db_session)
+        # Objective owned by report, in a different dept — visible via reporting chain
+        other_dept = make_department(db_session, name="Report Dept", slug="rpt-dept")
+        obj = make_objective(
+            db_session, owner=report, cycle=cycle, department_id=other_dept.id
+        )
+        q = scoped_objectives_query(exec_user, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj in results
+
+    def test_employee_on_project_sees_project_objectives(self, db_session):
+        """EMPLOYEE added to project team sees all objectives scoped to that team."""
+        dept_a = make_department(db_session, name="Dept A", slug="dept-a")
+        dept_b = make_department(db_session, name="Dept B", slug="dept-b")
+        employee = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        make_project_member(db_session, user=employee, project_team=pt)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        q = scoped_objectives_query(employee, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj in results
+
+    def test_employee_not_on_project_cannot_see_project_objectives(self, db_session):
+        """EMPLOYEE not on team cannot see project-scoped objectives."""
+        dept_a = make_department(db_session, name="Dept A2", slug="dept-a2")
+        dept_b = make_department(db_session, name="Dept B2", slug="dept-b2")
+        outsider = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        q = scoped_objectives_query(outsider, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj not in results
+
+    def test_employee_on_multiple_projects_sees_all(self, db_session):
+        """EMPLOYEE on two teams sees objectives from both."""
+        dept = make_department(db_session, name="Main Dept", slug="main-dept")
+        employee = make_user(db_session, department=dept)
+        owner = make_user(db_session, department=dept)
+        cycle = make_cycle(db_session)
+        pt1 = make_project_team(db_session, name="Team Alpha", primary_department=dept)
+        pt2 = make_project_team(db_session, name="Team Beta", primary_department=dept)
+        make_project_member(db_session, user=employee, project_team=pt1)
+        make_project_member(db_session, user=employee, project_team=pt2)
+        obj1 = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt1.id)
+        obj2 = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt2.id)
+        q = scoped_objectives_query(employee, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert obj1 in results
+        assert obj2 in results
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TestScopedKeyResultsQuery
@@ -187,20 +291,37 @@ class TestScopedKeyResultsQuery:
         results = list(db_session.execute(q).scalars())
         assert kr in results
 
-    def test_executive_sees_all_krs(self, db_session):
+    def test_c_suite_executive_sees_all_krs(self, db_session):
         owner, _, _, _, kr = self._setup(db_session)
-        exec_user = make_user(db_session, role=UserRole.EXECUTIVE)
+        exec_user = make_c_suite_user(db_session, role=UserRole.EXECUTIVE)
         q = scoped_key_results_query(exec_user, db_session)
         results = list(db_session.execute(q).scalars())
         assert kr in results
 
     def test_employee_sees_krs_on_accessible_objectives(self, db_session):
+        """Employee sees KRs on objectives they own."""
         owner, _, _, _, kr = self._setup(db_session)
         q = scoped_key_results_query(owner, db_session)
         results = list(db_session.execute(q).scalars())
         assert kr in results
 
+    def test_employee_on_project_sees_krs(self, db_session):
+        """Employee on a project team sees KRs on project-scoped objectives."""
+        dept_a = make_department(db_session, name="KR Dept A", slug="kr-dept-a")
+        dept_b = make_department(db_session, name="KR Dept B", slug="kr-dept-b")
+        employee = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        make_project_member(db_session, user=employee, project_team=pt)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        kr = make_key_result(db_session, objective=obj, owner=owner)
+        q = scoped_key_results_query(employee, db_session)
+        results = list(db_session.execute(q).scalars())
+        assert kr in results
+
     def test_employee_excludes_krs_on_inaccessible_objectives(self, db_session):
+        """Employee with no project membership cannot see KRs on others' objectives."""
         owner, _, dept, _, kr = self._setup(db_session)
         other_dept = make_department(db_session, name="Other", slug="other-kr")
         outsider = make_user(db_session, department=other_dept)
@@ -247,9 +368,9 @@ class TestScopedTasksQuery:
         results = list(db_session.execute(q).scalars())
         assert task in results
 
-    def test_executive_sees_all_tasks(self, db_session):
+    def test_c_suite_executive_sees_all_tasks(self, db_session):
         owner, _, _, _, _, task = self._setup(db_session)
-        exec_user = make_user(db_session, role=UserRole.EXECUTIVE)
+        exec_user = make_c_suite_user(db_session, role=UserRole.EXECUTIVE)
         q = scoped_tasks_query(exec_user, db_session)
         results = list(db_session.execute(q).scalars())
         assert task in results
@@ -261,10 +382,18 @@ class TestScopedTasksQuery:
         assert task in results
 
     def test_employee_sees_tasks_on_accessible_kr(self, db_session):
-        owner, _, dept, obj, kr, _ = self._setup(db_session)
-        colleague = make_user(db_session, department=dept)
+        """Employee on a project team sees unassigned tasks on KRs of that project."""
+        dept_a = make_department(db_session, name="Task Dept A", slug="task-dept-a")
+        dept_b = make_department(db_session, name="Task Dept B", slug="task-dept-b")
+        employee = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        make_project_member(db_session, user=employee, project_team=pt)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        kr = make_key_result(db_session, objective=obj, owner=owner)
         unassigned_task = make_task(db_session, key_result=kr)
-        q = scoped_tasks_query(colleague, db_session)
+        q = scoped_tasks_query(employee, db_session)
         results = list(db_session.execute(q).scalars())
         assert unassigned_task in results
 
@@ -432,23 +561,20 @@ class TestCanViewPredicates:
         admin = make_user(db_session, role=UserRole.ADMIN)
         assert can_view_objective(admin, obj) is True
 
-    def test_executive_can_view_any_objective(self, db_session):
+    def test_c_suite_can_view_any_objective(self, db_session):
+        """is_c_suite executive can view any objective."""
         _, _, _, obj, _, _ = self._setup(db_session)
-        exec_user = make_user(db_session, role=UserRole.EXECUTIVE)
+        exec_user = make_c_suite_user(db_session, role=UserRole.EXECUTIVE)
         assert can_view_objective(exec_user, obj) is True
 
     def test_employee_can_view_own_objective(self, db_session):
         owner, _, _, obj, _, _ = self._setup(db_session)
         assert can_view_objective(owner, obj) is True
 
-    def test_employee_can_view_dept_objective(self, db_session):
-        _, dept, _, obj, _, _ = self._setup(db_session)
-        colleague = make_user(db_session, department=dept)
-        assert can_view_objective(colleague, obj) is True
-
     def test_employee_cannot_view_other_dept_objective(self, db_session):
+        """Employee with no project membership cannot view objective not owned by them."""
         _, _, _, obj, _, _ = self._setup(db_session)
-        outsider = make_user(db_session)  # no dept
+        outsider = make_user(db_session)  # no dept, no project
         assert can_view_objective(outsider, obj) is False
 
     def test_partner_cannot_view_objective(self, db_session):
@@ -479,6 +605,47 @@ class TestCanViewPredicates:
         _, _, _, _, kr, _ = self._setup(db_session)
         partner = make_user(db_session, role=UserRole.PARTNER)
         assert can_view_key_result(partner, kr) is False
+
+    # --- Phase 2.4 new tests ---
+
+    def test_department_head_can_view_dept_objective(self, db_session):
+        """Non-c_suite EXECUTIVE can view objective in their dept."""
+        owner, dept, _, obj, _, _ = self._setup(db_session)
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=dept)
+        assert can_view_objective(exec_user, obj) is True
+
+    def test_department_head_cannot_view_other_dept_objective(self, db_session):
+        """Non-c_suite EXECUTIVE cannot view objective from a different dept."""
+        _, _, _, obj, _, _ = self._setup(db_session)
+        other_dept = make_department(db_session, name="Other", slug="cvp-other")
+        exec_user = make_user(db_session, role=UserRole.EXECUTIVE, department=other_dept)
+        assert can_view_objective(exec_user, obj) is False
+
+    def test_employee_on_project_can_view_project_objective(self, db_session):
+        """Employee who is a member of a project team can view objectives on that team."""
+        dept_a = make_department(db_session, name="View Dept A", slug="view-a")
+        dept_b = make_department(db_session, name="View Dept B", slug="view-b")
+        employee = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        make_project_member(db_session, user=employee, project_team=pt)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        # Need to reload to populate project_team relationship
+        db_session.refresh(obj)
+        assert can_view_objective(employee, obj) is True
+
+    def test_employee_not_on_project_cannot_view_project_objective(self, db_session):
+        """Employee not on a project team cannot view objectives scoped to it."""
+        dept_a = make_department(db_session, name="No-View Dept A", slug="nv-a")
+        dept_b = make_department(db_session, name="No-View Dept B", slug="nv-b")
+        outsider = make_user(db_session, department=dept_a)
+        owner = make_user(db_session, department=dept_b)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept_b)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        db_session.refresh(obj)
+        assert can_view_objective(outsider, obj) is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -580,6 +747,38 @@ class TestCanModifyPredicates:
         colleague = make_user(db_session, department=dept)
         # colleague doesn't own kr (owner_id=owner) nor obj (owner_id=owner)
         assert can_modify_key_result(colleague, kr) is False
+
+    # --- Phase 2.4 new tests ---
+
+    def test_project_lead_can_modify_project_objective(self, db_session):
+        """Employee who is LEAD on the project team can modify project objectives."""
+        dept = make_department(db_session, name="Lead Dept", slug="lead-dept")
+        lead = make_user(db_session, department=dept)
+        owner = make_user(db_session, department=dept)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept)
+        make_project_member(db_session, user=lead, project_team=pt, role_on_team=RoleOnTeam.LEAD)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        db_session.refresh(obj)
+        assert can_modify_objective(lead, obj) is True
+
+    def test_project_member_cannot_modify_project_objective(self, db_session):
+        """Employee who is a regular MEMBER on the project team cannot modify project objectives."""
+        dept = make_department(db_session, name="Mbr Dept", slug="mbr-dept")
+        member = make_user(db_session, department=dept)
+        owner = make_user(db_session, department=dept)
+        cycle = make_cycle(db_session)
+        pt = make_project_team(db_session, primary_department=dept)
+        make_project_member(db_session, user=member, project_team=pt, role_on_team=RoleOnTeam.MEMBER)
+        obj = make_objective(db_session, owner=owner, cycle=cycle, project_team_id=pt.id)
+        db_session.refresh(obj)
+        assert can_modify_objective(member, obj) is False
+
+    def test_c_suite_employee_can_modify_anything(self, db_session):
+        """is_c_suite with EMPLOYEE role can still modify any objective."""
+        _, _, _, obj, _, _ = self._setup(db_session)
+        compliance = make_c_suite_user(db_session, role=UserRole.EMPLOYEE)
+        assert can_modify_objective(compliance, obj) is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════

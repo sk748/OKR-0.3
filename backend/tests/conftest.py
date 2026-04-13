@@ -25,6 +25,10 @@ from backend.app.models import (
     Objective,
     OKRCommitmentType,
     OKRLevel,
+    ProjectTeam,
+    ProjectTeamDepartment,
+    ProjectTeamMember,
+    RoleOnTeam,
     StoplightStatus,
     Task,
     TaskStatus,
@@ -121,6 +125,8 @@ def make_user(
     email: str | None = None,
     role: UserRole = UserRole.EMPLOYEE,
     department: Department | None = None,
+    manager: "User | None" = None,
+    is_c_suite: bool = False,
     **overrides: Any,
 ) -> User:
     partner_scope = overrides.pop("partner_scope", None)
@@ -133,6 +139,8 @@ def make_user(
         "display_name": overrides.pop("display_name", "Test User"),
         "role": role,
         "department_id": department.id if department else None,
+        "manager_id": manager.id if manager else None,
+        "is_c_suite": is_c_suite,
         "is_active": overrides.pop("is_active", True),
     }
     # Only set partner_scope when non-None to avoid JSONB serializing
@@ -145,6 +153,17 @@ def make_user(
     session.add(user)
     session.flush()
     return user
+
+
+def make_c_suite_user(
+    session: Session,
+    *,
+    role: UserRole = UserRole.EXECUTIVE,
+    department: Department | None = None,
+    **overrides: Any,
+) -> User:
+    """Convenience wrapper that always sets is_c_suite=True."""
+    return make_user(session, role=role, department=department, is_c_suite=True, **overrides)
 
 
 def make_department(
@@ -267,3 +286,64 @@ def make_task(
     session.add(task)
     session.flush()
     return task
+
+
+def make_project_team(
+    session: Session,
+    *,
+    name: str = "Test Project",
+    primary_department: Department,
+    participating_departments: list[Department] | None = None,
+    **overrides: Any,
+) -> ProjectTeam:
+    """
+    Create a ProjectTeam.
+
+    The primary_department is always wired as a participating department.
+    Additional departments can be passed via participating_departments.
+    """
+    pt = ProjectTeam(
+        id=uuid.uuid4(),
+        name=name,
+        description=overrides.pop("description", None),
+        primary_department_id=primary_department.id,
+        **overrides,
+    )
+    session.add(pt)
+    session.flush()
+
+    # Wire participating departments — primary always included.
+    seen: set[uuid.UUID] = set()
+    for dept in (participating_departments or []):
+        if dept.id not in seen:
+            seen.add(dept.id)
+            session.add(ProjectTeamDepartment(
+                project_team_id=pt.id,
+                department_id=dept.id,
+            ))
+    # Primary dept always participates (add after loop to avoid duplication).
+    if primary_department.id not in seen:
+        session.add(ProjectTeamDepartment(
+            project_team_id=pt.id,
+            department_id=primary_department.id,
+        ))
+    session.flush()
+    return pt
+
+
+def make_project_member(
+    session: Session,
+    *,
+    user: User,
+    project_team: ProjectTeam,
+    role_on_team: RoleOnTeam = RoleOnTeam.MEMBER,
+) -> ProjectTeamMember:
+    """Add a user to a project team with a given role."""
+    m = ProjectTeamMember(
+        user_id=user.id,
+        project_team_id=project_team.id,
+        role_on_team=role_on_team,
+    )
+    session.add(m)
+    session.flush()
+    return m

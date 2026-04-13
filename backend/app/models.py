@@ -1,5 +1,5 @@
 """
-OKRSYNC — SQLAlchemy models (Phase 1).
+OKRSYNC — SQLAlchemy models (Phase 1 + Phase 2.4).
 
 Domain model for a Zero Trust OKR & Agile Sprint portal based on the
 "What Matters" framework (Doerr). Designed for PostgreSQL.
@@ -15,6 +15,12 @@ Conventions:
 
 Phase 2 will add: routes.py, services.py (scoring engine, RBAC query
 filters), and the Celery tasks that drain TransactionalOutbox.
+
+PRODUCTION NOTE: The schema additions made in Phase 2.4 (User.manager_id,
+User.is_c_suite, ProjectTeam, ProjectTeamMember, ProjectTeamDepartment,
+Objective.project_team_id) require an Alembic migration before deploying to
+PostgreSQL. SQLite test sessions recreate all tables automatically and do not
+require a migration.
 """
 
 from __future__ import annotations
@@ -133,6 +139,13 @@ class AlignmentType(str, enum.Enum):
     LADDER = "ladder"
 
 
+class RoleOnTeam(str, enum.Enum):
+    """Role a user plays within a ProjectTeam."""
+
+    LEAD = "lead"
+    MEMBER = "member"
+
+
 class TaskStatus(str, enum.Enum):
     TODO = "todo"
     IN_PROGRESS = "in_progress"
@@ -197,6 +210,17 @@ class User(Base):
     # internal users. Enforced in services.py query filters, not at the ORM layer.
     partner_scope: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
+    # Org-chart fields. manager_id is a self-FK; is_c_suite flags compliance /
+    # board / C-level users who get full read visibility regardless of dept.
+    manager_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    is_c_suite: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -207,6 +231,18 @@ class User(Base):
     department: Mapped[Optional["Department"]] = relationship(back_populates="members")
     owned_objectives: Mapped[list["Objective"]] = relationship(back_populates="owner")
     assigned_tasks: Mapped[list["Task"]] = relationship(back_populates="assignee")
+    manager: Mapped[Optional["User"]] = relationship(
+        back_populates="direct_reports",
+        foreign_keys="[User.manager_id]",
+        remote_side="User.id",
+    )
+    direct_reports: Mapped[list["User"]] = relationship(
+        back_populates="manager",
+        foreign_keys="[User.manager_id]",
+    )
+    project_memberships: Mapped[list["ProjectTeamMember"]] = relationship(
+        back_populates="user"
+    )
 
     __table_args__ = (
         # Partners must have a partner_scope; internal users must not.
@@ -216,6 +252,7 @@ class User(Base):
             name="ck_users_partner_scope_matches_role",
         ),
         Index("ix_users_role", "role"),
+        Index("ix_users_manager", "manager_id"),
     )
 
 
@@ -244,6 +281,103 @@ class Department(Base):
     children: Mapped[list["Department"]] = relationship(back_populates="parent")
     members: Mapped[list[User]] = relationship(back_populates="department")
     objectives: Mapped[list["Objective"]] = relationship(back_populates="department")
+
+
+# ---------------------------------------------------------------------------
+# Project Teams — cross-departmental groups that grant scoped visibility.
+# ---------------------------------------------------------------------------
+
+
+class ProjectTeam(Base):
+    """
+    A named cross-functional group. Employees on the team gain visibility into
+    all Objectives scoped to it. The primary_department owns/governs the team;
+    participating_departments are additional departments involved.
+    """
+
+    __tablename__ = "project_teams"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    primary_department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+        onupdate=func.now(), nullable=False
+    )
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    primary_department: Mapped["Department"] = relationship()
+    members: Mapped[list["ProjectTeamMember"]] = relationship(
+        back_populates="project_team", cascade="all, delete-orphan"
+    )
+    participating_departments: Mapped[list["ProjectTeamDepartment"]] = relationship(
+        back_populates="project_team", cascade="all, delete-orphan"
+    )
+    objectives: Mapped[list["Objective"]] = relationship(back_populates="project_team")
+
+    __table_args__ = (
+        Index("ix_project_teams_dept", "primary_department_id"),
+    )
+
+
+class ProjectTeamMember(Base):
+    """Join table: which users are members of which project teams, and in what role."""
+
+    __tablename__ = "project_team_members"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_teams.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    role_on_team: Mapped[RoleOnTeam] = mapped_column(
+        SQLEnum(RoleOnTeam, name="role_on_team"),
+        nullable=False,
+        default=RoleOnTeam.MEMBER,
+    )
+
+    user: Mapped["User"] = relationship(back_populates="project_memberships")
+    project_team: Mapped["ProjectTeam"] = relationship(back_populates="members")
+
+
+class ProjectTeamDepartment(Base):
+    """Join table: which departments participate in which project teams."""
+
+    __tablename__ = "project_team_departments"
+
+    project_team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_teams.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("departments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    project_team: Mapped["ProjectTeam"] = relationship(
+        back_populates="participating_departments"
+    )
+    department: Mapped["Department"] = relationship()
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +449,11 @@ class Objective(Base):
     department_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"), nullable=True
     )
+    project_team_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_teams.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     cycle_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("cycles.id", ondelete="RESTRICT"), nullable=False
     )
@@ -350,6 +489,9 @@ class Objective(Base):
 
     owner: Mapped[User] = relationship(back_populates="owned_objectives")
     department: Mapped[Optional[Department]] = relationship(back_populates="objectives")
+    project_team: Mapped[Optional["ProjectTeam"]] = relationship(
+        back_populates="objectives"
+    )
     cycle: Mapped[Cycle] = relationship(back_populates="objectives")
     key_results: Mapped[list["KeyResult"]] = relationship(
         back_populates="objective",
@@ -367,6 +509,7 @@ class Objective(Base):
         Index("ix_objectives_cycle_level", "cycle_id", "level"),
         Index("ix_objectives_owner", "owner_id"),
         Index("ix_objectives_parent_kr", "parent_key_result_id"),
+        Index("ix_objectives_project_team", "project_team_id"),
         # Soft-delete: most queries filter deleted_at IS NULL.
         Index("ix_objectives_active", "cycle_id", postgresql_where=(deleted_at.is_(None))),
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_objectives_progress_range"),

@@ -8,16 +8,19 @@ PARTNER is the zero-trust boundary. Every code path that might expose
 Objective, KeyResult, CheckIn, Reflection, or ChatMessage(key_result) to a
 PARTNER user must pass through this module first.
 
-Authority rules summary:
-  ADMIN       — full read/write on everything.
-  EXECUTIVE   — reads everything; modifies objectives/KRs in their dept or
-                owned by them; may cascade links.
-  EMPLOYEE    — reads/modifies own objectives + dept objectives; reads/modifies
-                own KRs + KRs on objectives they own; sees assigned tasks or
-                tasks on accessible KRs.
-  PARTNER     — zero-trust: only external tasks assigned to them. No access
-                to Objective, KeyResult, CheckIn, Reflection, KR-chat, or
-                AuditLog. Any such attempt writes an AuditLog denial row.
+Authority rules summary (Phase 2.4):
+  ADMIN          — full read/write on everything.
+  is_c_suite     — full read visibility regardless of role; write follows role rules.
+                   C-suite flag overrides EXECUTIVE dept-scoping and EMPLOYEE
+                   project-team scoping for read paths.
+  EXECUTIVE      — reads objectives in their dept + dept-participating projects +
+                   their reporting chain; modifies same; may cascade links.
+  EMPLOYEE       — reads/modifies own objectives + objectives on project teams
+                   they belong to; reads/modifies own KRs + KRs on accessible
+                   objectives; sees assigned tasks or tasks on accessible KRs.
+  PARTNER        — zero-trust: only external tasks assigned to them. No access
+                   to Objective, KeyResult, CheckIn, Reflection, KR-chat, or
+                   AuditLog. Any such attempt writes an AuditLog denial row.
 
 TRANSACTION RULE: scoped_*_query functions may call session.flush() after
 writing an AuditLog row (for PARTNER denial), but they NEVER call
@@ -30,7 +33,7 @@ import functools
 import uuid
 from typing import Callable
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, false, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import Select
 
@@ -39,6 +42,9 @@ from backend.app.models import (
     ChatMessage,
     KeyResult,
     Objective,
+    ProjectTeamDepartment,
+    ProjectTeamMember,
+    RoleOnTeam,
     Task,
     User,
     UserRole,
@@ -78,23 +84,54 @@ def _write_denied_audit(actor: User, action: str, session: Session) -> None:
     session.add(log)
 
 
-def _employee_obj_ids_subq(user: User) -> Select:
-    """
-    Return a SELECT of Objective.id values visible to an EMPLOYEE user.
+def _has_full_visibility(user: User) -> bool:
+    """Return True for ADMIN or any is_c_suite user (compliance, CEO, Board, etc.)."""
+    return user.role == UserRole.ADMIN or user.is_c_suite
 
-    Includes objectives the user owns, plus objectives whose department_id
-    matches the user's department (if they have one). Always excludes
-    soft-deleted rows.
+
+def _user_project_team_ids(user: User) -> Select:
+    """Subquery returning project_team_ids where *user* is a direct member."""
+    return select(ProjectTeamMember.project_team_id).where(
+        ProjectTeamMember.user_id == user.id
+    )
+
+
+def _user_department_project_team_ids(user: User) -> Select:
     """
-    base = Objective.deleted_at.is_(None)
+    Subquery returning project_team_ids where *user*'s department participates.
+    If the user has no department, returns an always-empty subquery.
+    """
+    q = select(ProjectTeamDepartment.project_team_id)
     if user.department_id is not None:
-        ownership = or_(
-            Objective.owner_id == user.id,
-            Objective.department_id == user.department_id,
+        return q.where(ProjectTeamDepartment.department_id == user.department_id)
+    return q.where(false())
+
+
+def _reporting_chain_user_ids(user: User, session: Session) -> list[uuid.UUID]:
+    """
+    Walk the manager_id tree DOWNWARD from *user* to collect all transitive
+    direct-reports, including the user themselves (so their own untagged
+    objectives are covered by the owner_id IN filter).
+
+    Uses BFS to avoid stack overflow on deep orgs. The visited set guards
+    against infinite loops in corrupt data (cycles in manager_id graph).
+    """
+    visited: set[uuid.UUID] = set()
+    queue: list[uuid.UUID] = [user.id]
+    result: list[uuid.UUID] = []
+    while queue:
+        current = queue.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        result.append(current)
+        rows = list(
+            session.execute(
+                select(User.id).where(User.manager_id == current)
+            ).scalars()
         )
-    else:
-        ownership = Objective.owner_id == user.id
-    return select(Objective.id).where(and_(base, ownership))
+        queue.extend(r for r in rows if r not in visited)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +143,15 @@ def scoped_objectives_query(user: User, session: Session) -> Select:
     """
     Return a SELECT statement for Objectives visible to *user*.
 
-    ADMIN / EXECUTIVE: all non-deleted objectives.
-    EMPLOYEE:          objectives they own + objectives in their department.
-    PARTNER:           raises PermissionError (writes audit row first).
+    ADMIN / is_c_suite:    all non-deleted objectives.
+    EXECUTIVE (dept head): objectives in their dept, OR on a project where
+                           their dept participates, OR owned by anyone in
+                           their reporting chain (including themselves).
+    EMPLOYEE:              objectives they own, OR on a project team they
+                           are an explicit member of.
+    PARTNER:               raises PermissionError (writes audit row first).
     """
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return select(Objective).where(Objective.deleted_at.is_(None))
 
     if user.role == UserRole.PARTNER:
@@ -118,27 +159,42 @@ def scoped_objectives_query(user: User, session: Session) -> Select:
         session.flush()
         raise PermissionError("partners may not access objectives")
 
-    # EMPLOYEE
     base = Objective.deleted_at.is_(None)
-    if user.department_id is not None:
-        ownership = or_(
-            Objective.owner_id == user.id,
-            Objective.department_id == user.department_id,
+
+    if user.role == UserRole.EXECUTIVE:
+        chain_ids = _reporting_chain_user_ids(user, session)
+        conditions = [Objective.owner_id.in_(chain_ids)]
+        if user.department_id is not None:
+            conditions.append(Objective.department_id == user.department_id)
+            conditions.append(
+                Objective.project_team_id.in_(
+                    _user_department_project_team_ids(user)
+                )
+            )
+        return select(Objective).where(and_(base, or_(*conditions)))
+
+    # EMPLOYEE
+    return select(Objective).where(
+        and_(
+            base,
+            or_(
+                Objective.owner_id == user.id,
+                Objective.project_team_id.in_(_user_project_team_ids(user)),
+            ),
         )
-    else:
-        ownership = Objective.owner_id == user.id
-    return select(Objective).where(and_(base, ownership))
+    )
 
 
 def scoped_key_results_query(user: User, session: Session) -> Select:
     """
     Return a SELECT statement for KeyResults visible to *user*.
 
-    ADMIN / EXECUTIVE: all non-deleted key results.
-    EMPLOYEE:          key results on objectives accessible to them.
-    PARTNER:           raises PermissionError (writes audit row first).
+    ADMIN / is_c_suite:    all non-deleted key results.
+    EXECUTIVE / EMPLOYEE:  key results on objectives accessible to them
+                           (delegates to scoped_objectives_query logic).
+    PARTNER:               raises PermissionError (writes audit row first).
     """
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return select(KeyResult).where(KeyResult.deleted_at.is_(None))
 
     if user.role == UserRole.PARTNER:
@@ -146,11 +202,14 @@ def scoped_key_results_query(user: User, session: Session) -> Select:
         session.flush()
         raise PermissionError("partners may not access key results")
 
-    # EMPLOYEE
+    # Build the objective visibility subquery inline (avoids calling the
+    # full scoped_objectives_query which returns a full SELECT — we just
+    # need the id-set subquery here).
+    obj_ids_subq = _visible_objective_ids_subq(user, session)
     return select(KeyResult).where(
         and_(
             KeyResult.deleted_at.is_(None),
-            KeyResult.objective_id.in_(_employee_obj_ids_subq(user)),
+            KeyResult.objective_id.in_(obj_ids_subq),
         )
     )
 
@@ -159,13 +218,15 @@ def scoped_tasks_query(user: User, session: Session) -> Select:
     """
     Return a SELECT statement for Tasks visible to *user*.
 
-    ADMIN / EXECUTIVE: all non-deleted tasks.
-    EMPLOYEE:          tasks assigned to them OR on accessible key results.
-    PARTNER:           direct indexed lookup — is_external=True AND assignee_id
-                       only. Never joins through KR/Objective hierarchy.
-                       Uses ix_tasks_partner_scope partial index on PostgreSQL.
+    ADMIN / is_c_suite:    all non-deleted tasks.
+    EXECUTIVE:             all tasks on key results whose objective is visible.
+                           (Executives may need to monitor sprint progress.)
+    EMPLOYEE:              tasks assigned to them OR on accessible key results.
+    PARTNER:               direct indexed lookup — is_external=True AND
+                           assignee_id only. Never joins through KR/Objective.
+                           Uses ix_tasks_partner_scope partial index on PG.
     """
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return select(Task).where(Task.deleted_at.is_(None))
 
     if user.role == UserRole.PARTNER:
@@ -178,13 +239,24 @@ def scoped_tasks_query(user: User, session: Session) -> Select:
             )
         )
 
-    # EMPLOYEE
+    obj_ids_subq = _visible_objective_ids_subq(user, session)
     kr_ids_subq = select(KeyResult.id).where(
         and_(
             KeyResult.deleted_at.is_(None),
-            KeyResult.objective_id.in_(_employee_obj_ids_subq(user)),
+            KeyResult.objective_id.in_(obj_ids_subq),
         )
     )
+
+    if user.role == UserRole.EXECUTIVE:
+        # Executive sees all tasks on their visible KRs.
+        return select(Task).where(
+            and_(
+                Task.deleted_at.is_(None),
+                Task.key_result_id.in_(kr_ids_subq),
+            )
+        )
+
+    # EMPLOYEE
     return select(Task).where(
         and_(
             Task.deleted_at.is_(None),
@@ -205,20 +277,18 @@ def scoped_chat_query(
     """
     Return a SELECT statement for ChatMessages in the given context.
 
-    ADMIN / EXECUTIVE: all messages in the context regardless of visibility.
+    ADMIN / is_c_suite:    all messages in the context.
 
-    EMPLOYEE (task):   messages if the task is accessible to them (assignee or
-                       KR on an accessible objective).
-    EMPLOYEE (kr):     messages if the KR's objective is accessible to them.
+    EMPLOYEE (task):    messages if the task is accessible to them (assignee or
+                        KR on a visible objective).
+    EMPLOYEE (kr):      messages if the KR's objective is visible to them.
 
-    PARTNER (task):    first verifies the task is visible to this partner via the
-                       same direct indexed lookup as scoped_tasks_query. If the
-                       task is not visible (not assigned, not external, soft-deleted,
-                       or wrong assignee), writes audit row + raises PermissionError.
-                       Returns message rows only if the task IS visible.
-    PARTNER (kr):      always raises PermissionError (writes audit row first).
+    PARTNER (task):     first verifies the task is visible to this partner via
+                        the same direct indexed lookup as scoped_tasks_query.
+                        Raises PermissionError + writes audit row if not visible.
+    PARTNER (kr):       always raises PermissionError (writes audit row first).
     """
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return select(ChatMessage).where(
             and_(
                 ChatMessage.context_type == context_type,
@@ -259,12 +329,14 @@ def scoped_chat_query(
             )
         )
 
-    # EMPLOYEE
+    # EMPLOYEE / EXECUTIVE (non-c_suite)
+    obj_ids_subq = _visible_objective_ids_subq(user, session)
+
     if context_type == "task":
         kr_ids_subq = select(KeyResult.id).where(
             and_(
                 KeyResult.deleted_at.is_(None),
-                KeyResult.objective_id.in_(_employee_obj_ids_subq(user)),
+                KeyResult.objective_id.in_(obj_ids_subq),
             )
         )
         accessible_task_ids = select(Task.id).where(
@@ -284,11 +356,11 @@ def scoped_chat_query(
             )
         )
 
-    # EMPLOYEE, context_type == "key_result"
+    # context_type == "key_result"
     accessible_kr_ids = select(KeyResult.id).where(
         and_(
             KeyResult.deleted_at.is_(None),
-            KeyResult.objective_id.in_(_employee_obj_ids_subq(user)),
+            KeyResult.objective_id.in_(obj_ids_subq),
         )
     )
     return select(ChatMessage).where(
@@ -296,6 +368,42 @@ def scoped_chat_query(
             ChatMessage.context_type == "key_result",
             ChatMessage.context_id == context_id,
             ChatMessage.context_id.in_(accessible_kr_ids),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal subquery helper shared by KR / Task / Chat query functions
+# ---------------------------------------------------------------------------
+
+
+def _visible_objective_ids_subq(user: User, session: Session) -> Select:
+    """
+    Return a subquery of Objective.id values visible to *user*.
+    Caller must have already excluded ADMIN/is_c_suite/PARTNER before calling.
+    """
+    base = Objective.deleted_at.is_(None)
+
+    if user.role == UserRole.EXECUTIVE:
+        chain_ids = _reporting_chain_user_ids(user, session)
+        conditions = [Objective.owner_id.in_(chain_ids)]
+        if user.department_id is not None:
+            conditions.append(Objective.department_id == user.department_id)
+            conditions.append(
+                Objective.project_team_id.in_(
+                    _user_department_project_team_ids(user)
+                )
+            )
+        return select(Objective.id).where(and_(base, or_(*conditions)))
+
+    # EMPLOYEE
+    return select(Objective.id).where(
+        and_(
+            base,
+            or_(
+                Objective.owner_id == user.id,
+                Objective.project_team_id.in_(_user_project_team_ids(user)),
+            ),
         )
     )
 
@@ -309,21 +417,36 @@ def can_view_objective(user: User, objective: Objective) -> bool:
     """
     Return True if *user* may read *objective*.
 
-    PARTNER: never.
-    ADMIN / EXECUTIVE: always.
-    EMPLOYEE: if they own it OR if it belongs to their department.
+    PARTNER:            never.
+    ADMIN / is_c_suite: always.
+    EXECUTIVE:          owns it, OR it is in their dept, OR it is on a project
+                        team where their dept participates (requires
+                        objective.project_team.participating_departments loaded).
+    EMPLOYEE:           owns it, OR is an explicit member of its project team
+                        (requires objective.project_team.members loaded).
     """
     if user.role == UserRole.PARTNER:
         return False
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return True
+    if user.role == UserRole.EXECUTIVE:
+        if objective.owner_id == user.id:
+            return True
+        if user.department_id and objective.department_id == user.department_id:
+            return True
+        if objective.project_team_id and objective.project_team:
+            for ptd in objective.project_team.participating_departments:
+                if ptd.department_id == user.department_id:
+                    return True
+        return False
     # EMPLOYEE
     if objective.owner_id == user.id:
         return True
-    return (
-        user.department_id is not None
-        and objective.department_id == user.department_id
-    )
+    if objective.project_team_id and objective.project_team:
+        for m in objective.project_team.members:
+            if m.user_id == user.id:
+                return True
+    return False
 
 
 def can_view_key_result(user: User, kr: KeyResult) -> bool:
@@ -332,12 +455,12 @@ def can_view_key_result(user: User, kr: KeyResult) -> bool:
     Requires kr.objective to be loaded (lazy load is fine within a session).
 
     PARTNER: never.
-    ADMIN / EXECUTIVE: always.
-    EMPLOYEE: if they can view the parent objective.
+    ADMIN / is_c_suite: always.
+    EXECUTIVE / EMPLOYEE: if they can view the parent objective.
     """
     if user.role == UserRole.PARTNER:
         return False
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return True
     return can_view_objective(user, kr.objective)
 
@@ -349,14 +472,14 @@ def can_view_task(user: User, task: Task) -> bool:
     for the EMPLOYEE branch.
 
     PARTNER: only if is_external=True AND they are the assignee.
-    ADMIN / EXECUTIVE: always.
-    EMPLOYEE: if they are the assignee OR if they can view the KR.
+    ADMIN / is_c_suite: always.
+    EMPLOYEE / EXECUTIVE: if they are the assignee OR if they can view the KR.
     """
     if user.role == UserRole.PARTNER:
         return task.is_external and task.assignee_id == user.id
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
         return True
-    # EMPLOYEE
+    # EMPLOYEE / EXECUTIVE
     if task.assignee_id == user.id:
         return True
     return can_view_key_result(user, task.key_result)
@@ -366,24 +489,34 @@ def can_modify_objective(user: User, objective: Objective) -> bool:
     """
     Return True if *user* may write to *objective*.
 
-    PARTNER: never.
-    ADMIN: always.
-    EXECUTIVE: if they own it OR if it belongs to their department.
-    EMPLOYEE: only if they own it.
+    PARTNER:            never.
+    ADMIN / is_c_suite: always.
+    EXECUTIVE:          owns it, in their dept, OR dept participates in its
+                        project team (requires participating_departments loaded).
+    EMPLOYEE:           owns it, OR is a LEAD on its project team.
     """
     if user.role == UserRole.PARTNER:
         return False
-    if user.role == UserRole.ADMIN:
+    if _has_full_visibility(user):
         return True
     if user.role == UserRole.EXECUTIVE:
         if objective.owner_id == user.id:
             return True
-        return (
-            user.department_id is not None
-            and objective.department_id == user.department_id
-        )
-    # EMPLOYEE
-    return objective.owner_id == user.id
+        if user.department_id and objective.department_id == user.department_id:
+            return True
+        if objective.project_team_id and objective.project_team:
+            for ptd in objective.project_team.participating_departments:
+                if ptd.department_id == user.department_id:
+                    return True
+        return False
+    # EMPLOYEE: owns it or is a project team LEAD
+    if objective.owner_id == user.id:
+        return True
+    if objective.project_team_id and objective.project_team:
+        for m in objective.project_team.members:
+            if m.user_id == user.id and m.role_on_team == RoleOnTeam.LEAD:
+                return True
+    return False
 
 
 def can_modify_key_result(user: User, kr: KeyResult) -> bool:
@@ -391,16 +524,17 @@ def can_modify_key_result(user: User, kr: KeyResult) -> bool:
     Return True if *user* may write to *kr*.
     Requires kr.objective to be loaded (lazy load is fine within a session).
 
-    PARTNER: never.
-    ADMIN: always.
-    EXECUTIVE: same authority as can_modify_objective on the parent objective.
-    EMPLOYEE: if they own the KR OR if they own the parent objective.
-              (Rationale: an Objective owner reasonably controls its KRs even
-              when a separate person is formally listed as the KR owner.)
+    PARTNER:            never.
+    ADMIN / is_c_suite: always.
+    EXECUTIVE:          same authority as can_modify_objective on the parent
+                        objective.
+    EMPLOYEE:           if they own the KR OR if they own the parent objective.
+                        (Rationale: an Objective owner reasonably controls its
+                        KRs even when a separate person is formally the KR owner.)
     """
     if user.role == UserRole.PARTNER:
         return False
-    if user.role == UserRole.ADMIN:
+    if _has_full_visibility(user):
         return True
     if user.role == UserRole.EXECUTIVE:
         return can_modify_objective(user, kr.objective)
@@ -413,13 +547,16 @@ def can_modify_task(user: User, task: Task) -> bool:
     Return True if *user* may write to *task*.
     Requires task.key_result to be loaded for the EMPLOYEE branch.
 
-    PARTNER: never.
-    ADMIN / EXECUTIVE: always.
-    EMPLOYEE: if they are the assignee OR if they own the KR.
+    PARTNER:            never.
+    ADMIN / is_c_suite: always.
+    EXECUTIVE:          always (mirrors their broad read access to tasks).
+    EMPLOYEE:           if they are the assignee OR if they own the KR.
     """
     if user.role == UserRole.PARTNER:
         return False
-    if user.role in (UserRole.ADMIN, UserRole.EXECUTIVE):
+    if _has_full_visibility(user):
+        return True
+    if user.role == UserRole.EXECUTIVE:
         return True
     # EMPLOYEE: assignee or KR owner
     return task.assignee_id == user.id or task.key_result.owner_id == user.id
